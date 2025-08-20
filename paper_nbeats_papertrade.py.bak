@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""
+paper_nbeats_papertrade.py
+
+Walk-forward paper trading/backtest using Darts N-BEATS probabilistic forecasts
+and a simple execution model. Starts with imaginary capital (default $1000).
+Saves trade log, equity curve, signal CSV, and a plot.
+
+Modes:
+ - backtest : walk-forward historical simulation (default)
+ - live_sim : fetch fresh data, run one prediction and simulate immediate trade (useful for forward-testing)
+
+Example:
+ python paper_nbeats_papertrade.py --mode backtest --symbol BTC/USDT --timeframe 1h --max_bars 2000 \
+    --forecast_steps 1 --hold_bars 1 --epochs 6 --retrain_every 24 --initial_capital 1000
+
+Notes:
+ - By default the script trains N-BEATS on the training window and retrains every `--retrain_every`
+   test steps. For faster iteration, keep epochs small (6-12). Larger epochs give better models but
+   increase runtime drastically.
+ - Execution uses next-bar OPEN as entry price and exit after `hold_bars` at close price.
+"""
+
+import argparse
+import time
+from pathlib import Path
+import math
+import warnings
+
+import ccxt
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+# Darts
+from darts import TimeSeries
+from darts.models import NBEATSModel
+
+warnings.filterwarnings("ignore")
+
+# ---------------------
+# Helpers: metrics, fetcher, trading primitives
+# ---------------------
+def fetch_ohlcv_full(exchange, symbol="BTC/USDT", timeframe="1h", since=None, limit=1000, max_bars=3000):
+    """
+    Page through exchange.fetch_ohlcv to get up to max_bars rows.
+    Returns pandas DataFrame indexed by timestamp with columns o,h,l,c,v
+    """
+    all_klines = []
+    ex = exchange
+    fetch_since = since
+    pbar = tqdm(total=max_bars, desc=f"Fetching {symbol} {timeframe}")
+    while True:
+        try:
+            chunk = ex.fetch_ohlcv(symbol, timeframe=timeframe, since=fetch_since, limit=limit)
+        except Exception as e:
+            print("fetch error, sleeping 1s:", e)
+            time.sleep(1)
+            continue
+
+        if not chunk:
+            break
+
+        all_klines.extend(chunk)
+        pbar.update(len(chunk))
+
+        last_ts = chunk[-1][0]
+        fetch_since = last_ts + 1
+        if len(chunk) < limit or len(all_klines) >= max_bars:
+            break
+        time.sleep(0.12)
+
+    pbar.close()
+    if not all_klines:
+        raise RuntimeError("No OHLCV returned")
+
+    df = pd.DataFrame(all_klines, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df = df.set_index("timestamp")
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df
+
+def max_drawdown(equity):
+    # equity: numpy array or pd.Series of cumulative equity values
+    equity = np.asarray(equity)
+    highwater = np.maximum.accumulate(equity)
+    dd = (equity - highwater) / highwater
+    return float(np.min(dd))
+
+def annualized_sharpe(returns, periods_per_year):
+    # returns: series of simple returns per-step (not log), e.g. pct change of equity between steps
+    r = np.array(returns)
+    if r.size < 2:
+        return 0.0
+    mean_r = np.mean(r)
+    std_r = np.std(r, ddof=1)
+    if std_r == 0:
+        return 0.0
+    return float((mean_r / std_r) * math.sqrt(periods_per_year))
+
+# Simple decision mapping from quantiles -> signal
+def decide_signal_from_quantiles(median_ret, low_ret, high_ret, thr):
+    # returns one of STRONG_BUY, BUY, HOLD, SELL, STRONG_SELL
+    if median_ret >= thr and low_ret > 0:
+        return "STRONG_BUY"
+    if median_ret >= thr and low_ret <= 0:
+        return "BUY"
+    if abs(median_ret) < thr:
+        return "HOLD"
+    if median_ret <= -thr and high_ret < 0:
+        return "STRONG_SELL"
+    if median_ret <= -thr and high_ret >= 0:
+        return "SELL"
+    return "HOLD"
+
+# Map signals to position sizes (fraction of equity)
+DEFAULT_POS_SIZING = {
+    "STRONG_BUY": 0.25,
+    "BUY": 0.12,
+    "HOLD": 0.0,
+    "SELL": -0.12,        # negative = short
+    "STRONG_SELL": -0.25,
+}
+
+# ---------------------
+# Core backtest / live-sim routine
+# ---------------------
+def walk_forward_backtest(df, args):
+    """
+    df: historical OHLCV DataFrame with index timestamps (ascending)
+    args: parsed args
+    Returns trade log DataFrame and equity curve DataFrame
+    """
+    close = df["close"]
+    n = len(df)
+    train_size = int(args.train_frac * n)
+    if train_size < 100:
+        raise ValueError("Train fraction too small or not enough bars; increase max_bars or train_frac")
+
+    # initial train window until train_end_idx (exclusive)
+    train_end_idx = train_size
+    test_start_idx = train_end_idx
+    test_end_idx = n - args.hold_bars  # we need hold_bars forward for exit pricing
+
+    print(f"Total bars: {n}, train_end_idx={train_end_idx}, test from {test_start_idx} to {test_end_idx-1}")
+
+    # bookkeeping
+    capital = float(args.initial_capital)
+    equity_ts = []
+    equity_time = []
+    trades = []
+
+    # periods per year for Sharpe (estimate from timeframe)
+    tf = args.timeframe
+    if tf.endswith("h"):
+        hours = int(tf[:-1])
+        periods_per_year = int(24 / hours * 365)
+    elif tf.endswith("m"):
+        mins = int(tf[:-1])
+        periods_per_year = int(60 / mins * 24 * 365)
+    elif tf.endswith("d"):
+        periods_per_year = 365 // int(tf[:-1]) if tf[:-1].isdigit() else 365
+    else:
+        periods_per_year = 365 * 24
+
+    # initial model trained on initial training window
+    model = None
+    last_trained_at = None
+
+    # Prepare TimeSeries training series and reuse model until retrain
+    for idx in tqdm(range(test_start_idx, test_end_idx), desc="Walk-forward"):
+        # train or reuse model
+        if model is None or ((idx - (last_trained_at or train_end_idx)) >= args.retrain_every):
+            # prepare series up to idx (inclusive of idx-1)
+            hist_close = close.iloc[:idx]
+            ts = TimeSeries.from_series(hist_close)
+            # model init & fit
+            model = NBEATSModel(
+                input_chunk_length=args.input_chunk_length,
+                output_chunk_length=args.forecast_steps,
+                generic_architecture=True,
+                n_epochs=args.epochs,
+                random_state=42,
+                force_reset=True,
+            )
+
+            # training: use small val split from history
+            val_points = min(args.val_points, max(1, len(ts)//10))
+            if val_points >= len(ts):
+                train_ts = ts[:-1]
+                val_ts = ts[-1:]
+            else:
+                train_ts, val_ts = ts[:-val_points], ts[-val_points:]
+            model.fit(train_ts, val_series=val_ts)
+            last_trained_at = idx
+
+        # predict probabilistic samples for forecast_steps
+        prob_pred = model.predict(n=args.forecast_steps, num_samples=args.num_samples)
+        # get quantiles
+        q_low_ts = prob_pred.quantile_timeseries(args.low_q)
+        q_mid_ts = prob_pred.quantile_timeseries(0.5)
+        q_high_ts = prob_pred.quantile_timeseries(args.high_q)
+
+        # we trade on the first predicted step (next bar)
+        pred_ts_index = q_mid_ts.time_index()
+        pred0_idx = pred_ts_index[0]  # timestamp for predicted next bar
+        # median / low / high predictions for first predicted step
+        median_pred = float(q_mid_ts.pd_series().iloc[0])
+        low_pred = float(q_low_ts.pd_series().iloc[0])
+        high_pred = float(q_high_ts.pd_series().iloc[0])
+
+        last_price = float(close.iloc[idx-1])  # most recent observed close at time of decision
+        median_ret = (median_pred - last_price) / last_price
+        low_ret = (low_pred - last_price) / last_price
+        high_ret = (high_pred - last_price) / last_price
+
+        signal = decide_signal_from_quantiles(median_ret, low_ret, high_ret, args.threshold_pct)
+        pos_frac = args.pos_sizing.get(signal, 0.0)
+        # position USD value to allocate (absolute)
+        allocation = abs(pos_frac) * capital
+        # entry price assumed: next-bar OPEN (if available), else next-bar close
+        entry_row = df.iloc[idx]
+        entry_price = float(entry_row["open"]) if "open" in df.columns else float(entry_row["close"])
+        # number of units (coins) bought or shorted
+        units = allocation / entry_price if entry_price > 0 else 0.0
+        side = "LONG" if pos_frac > 0 else ("SHORT" if pos_frac < 0 else "NONE")
+
+        # simulate hold for hold_bars and exit at that close
+        exit_idx = idx + args.hold_bars
+        exit_price = float(df.iloc[exit_idx]["close"])
+        # compute gross pnl in USD (for long: (exit-entry)*units; for short: opposite)
+        if side == "LONG":
+            gross_pnl = (exit_price - entry_price) * units
+        elif side == "SHORT":
+            gross_pnl = (entry_price - exit_price) * units
+        else:
+            gross_pnl = 0.0
+
+        # fees and slippage
+        fee = (abs(units) * entry_price) * args.taker_fee  # entry fee
+        fee += (abs(units) * exit_price) * args.taker_fee  # exit fee
+        slippage_cost = (abs(units) * entry_price) * args.slippage + (abs(units) * exit_price) * args.slippage
+        net_pnl = gross_pnl - fee - slippage_cost
+
+        # update capital & record trade only if side != NONE
+        if side != "NONE" and abs(net_pnl) > 1e-12:
+            capital += net_pnl
+
+        # record equity point at exit time
+        equity_ts.append(capital)
+        equity_time.append(df.index[exit_idx])
+
+        trades.append({
+            "decision_time": df.index[idx-1],
+            "signal_time": pred0_idx,
+            "signal": signal,
+            "side": side,
+            "entry_time": df.index[idx],
+            "entry_price": entry_price,
+            "exit_time": df.index[exit_idx],
+            "exit_price": exit_price,
+            "units": units,
+            "allocation_usd": allocation,
+            "gross_pnl": gross_pnl,
+            "fee_usd": fee,
+            "slippage_usd": slippage_cost,
+            "net_pnl": net_pnl,
+            "capital_after": capital,
+            "median_pred": median_pred,
+            "low_pred": low_pred,
+            "high_pred": high_pred,
+            "median_ret": median_ret,
+            "low_ret": low_ret,
+            "high_ret": high_ret,
+        })
+
+        # optionally: online incremental learning / adapt hyperparams (not implemented here).
+        # We retrain periodically per args.retrain_every above.
+
+    trades_df = pd.DataFrame(trades)
+    equity_df = pd.DataFrame({"timestamp": equity_time, "equity": equity_ts}).set_index("timestamp")
+    return trades_df, equity_df, capital, periods_per_year
+
+# ---------------------
+# Main CLI
+# ---------------------
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["backtest", "live_sim"], default="backtest")
+    p.add_argument("--symbol", default="BTC/USDT")
+    p.add_argument("--timeframe", default="1h")
+    p.add_argument("--max_bars", type=int, default=2000)
+    p.add_argument("--train_frac", type=float, default=0.6)
+    p.add_argument("--val_points", type=int, default=168)
+    p.add_argument("--input_chunk_length", type=int, default=168)
+    p.add_argument("--forecast_steps", type=int, default=1)
+    p.add_argument("--hold_bars", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=6,
+                   help="N-BEATS training epochs per retrain (small for fast iteration)")
+    p.add_argument("--retrain_every", type=int, default=24,
+                   help="retrain model every N test steps (set large to reduce retrain frequency)")
+    p.add_argument("--num_samples", type=int, default=200)
+    p.add_argument("--low_q", type=float, default=0.10)
+    p.add_argument("--high_q", type=float, default=0.90)
+    p.add_argument("--threshold_pct", type=float, default=0.002, help="decision threshold (e.g. 0.002 = 0.2%)")
+    p.add_argument("--initial_capital", type=float, default=1000.0)
+    p.add_argument("--taker_fee", type=float, default=0.001, help="per-trade fee fraction (default 0.1%)")
+    p.add_argument("--slippage", type=float, default=0.0005, help="per-trade slippage fraction (default 0.05%)")
+    p.add_argument("--output_dir", default="./paper_out")
+    args = p.parse_args()
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    exchange = ccxt.binance({"enableRateLimit": True})
+    print("Fetching historical OHLCV...")
+    df = fetch_ohlcv_full(exchange, symbol=args.symbol, timeframe=args.timeframe, max_bars=args.max_bars)
+    print(f"Fetched {len(df)} bars from {df.index[0]} to {df.index[-1]}")
+
+    # enforce OHLCV columns
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col not in df.columns:
+            raise RuntimeError(f"Missing column {col} in fetched data")
+
+    # run backtest
+    trades_df, equity_df, final_capital, periods_per_year = walk_forward_backtest(df, args)
+
+    # compute simple metrics
+    returns = equity_df["equity"].pct_change().fillna(0).values
+    ann_sharpe = annualized_sharpe(returns, periods_per_year)
+    mdd = max_drawdown(equity_df["equity"].values)
+    total_return = (final_capital / args.initial_capital - 1.0) * 100.0
+
+    print("\n--- BACKTEST SUMMARY ---")
+    print(f"Initial capital: ${args.initial_capital:.2f}")
+    print(f"Final capital:   ${final_capital:.2f}")
+    print(f"Total return:    {total_return:.2f}%")
+    print(f"Ann. Sharpe (est): {ann_sharpe:.3f}")
+    print(f"Max Drawdown:    {mdd*100:.2f}%")
+    print(f"Number of trades: {len(trades_df)}")
+    if len(trades_df):
+        wins = (trades_df["net_pnl"] > 0).sum()
+        print(f"Winning trades: {wins} / {len(trades_df)} ({wins/len(trades_df)*100:.1f}%)")
+        print(f"Avg net PnL per trade: ${trades_df['net_pnl'].mean():.2f}")
+
+    # save outputs
+    trades_csv = out_dir / "trades_log.csv"
+    equity_csv = out_dir / "equity_curve.csv"
+    trades_df.to_csv(trades_csv, index=False)
+    equity_df.to_csv(equity_csv)
+
+    # plot equity curve
+    plt.figure(figsize=(10,5))
+    if not equity_df.empty:
+        plt.plot(equity_df.index, equity_df["equity"], label="equity")
+    plt.title("Paper-trade equity curve")
+    plt.xlabel("time")
+    plt.ylabel("USD")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plot_file = out_dir / "equity_curve.png"
+    plt.savefig(plot_file)
+    plt.show()
+
+    print("\nSaved files to:", out_dir)
+    print("Trades CSV:", trades_csv)
+    print("Equity CSV:", equity_csv)
+
+if __name__ == "__main__":
+    main()
