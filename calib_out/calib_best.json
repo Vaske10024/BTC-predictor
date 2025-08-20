@@ -1,0 +1,12 @@
+{
+  "prob": 0.7,
+  "thr": 0.0005,
+  "atr_mult": 1.5,
+  "hold": 4.0,
+  "n_trades": 17.0,
+  "avg_net_return_pct": -0.0037048644056641377,
+  "total_net_return_pct": -0.06298269489629034,
+  "win_rate": 0.23529411764705882,
+  "avg_net_return_ci_l": -0.0053286818967217065,
+  "avg_net_return_ci_u": -0.0019545321742764016
+}

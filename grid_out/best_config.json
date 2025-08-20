@@ -1,0 +1,12 @@
+{
+  "prob_threshold": 0.9,
+  "threshold_pct": 0.01,
+  "atr_multiplier_stop": 1.5,
+  "risk_per_trade": 0.005,
+  "input_chunk_length": 72,
+  "use_wavelet": true,
+  "use_vol_sizing": false,
+  "num_blocks": 2,
+  "num_layers": 3,
+  "layer_widths": 128
+}
