@@ -1,0 +1,15 @@
+{
+  "best_params": {
+    "prob_threshold": 0.95,
+    "threshold_pct": 0.002,
+    "atr_multiplier_stop": 2.5,
+    "risk_per_trade": 0.01,
+    "input_chunk_length": 48,
+    "use_wavelet": false,
+    "use_vol_sizing": false,
+    "num_blocks": 3,
+    "num_layers": 4,
+    "layer_widths": 128
+  },
+  "best_value": -16.19302601464445
+}
